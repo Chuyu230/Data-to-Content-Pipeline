@@ -1,0 +1,92 @@
+#手动打开浏览器
+
+from playwright.sync_api import sync_playwright
+import pandas as pd
+import urllib.parse
+import os
+
+
+KEYWORDS = [
+    "medical tourism",
+    "treatment abroad",
+    "cancer screening abroad",
+    "health check abroad",
+    "hospital overseas",
+    "cheaper treatment overseas"
+]
+
+MAX_SCROLLS = 8
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+OUTPUT_PATH = os.path.join(BASE_DIR, "data", "raw", "reddit_post_links.csv")
+
+
+def collect_links_by_keyword(page, keyword, max_scrolls=8):
+    query = urllib.parse.quote(keyword)
+    url = f"https://www.reddit.com/search/?q={query}&type=posts"
+
+    print(f"\n搜索关键词: {keyword}")
+    print(f"打开页面: {url}")
+
+    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(5000)
+
+    links = set()
+
+    for i in range(max_scrolls):
+        print(f"滚动第 {i+1}/{max_scrolls} 次")
+
+        hrefs = page.locator("a[href*='/comments/']").evaluate_all(
+            "els => els.map(el => el.href).filter(Boolean)"
+        )
+
+        before = len(links)
+
+        for href in hrefs:
+            href_clean = href.split("?")[0]
+            href_lower = href_clean.lower()
+
+            if "/comments/" in href_lower and "reddit.com/r/" in href_lower:
+                links.add(href_clean)
+
+        after = len(links)
+        print(f"本轮新增: {after - before}，当前累计: {after}")
+
+        page.mouse.wheel(0, 6000)
+        page.wait_for_timeout(2500)
+
+    return sorted(list(links))
+
+
+def main():
+    all_rows = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+        context = browser.contexts[0]
+        page = context.pages[0] if context.pages else context.new_page()
+
+        for keyword in KEYWORDS:
+            links = collect_links_by_keyword(page, keyword, MAX_SCROLLS)
+            print(f"关键词 '{keyword}' 共抓到 {len(links)} 个帖子链接")
+
+            for link in links:
+                all_rows.append({
+                    "query": keyword,
+                    "post_url": link
+                })
+
+    df = pd.DataFrame(all_rows).drop_duplicates()
+
+    # ⭐ 自动创建文件夹（避免报错）
+    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+
+    df.to_csv(OUTPUT_PATH, index=False, encoding="utf-8-sig")
+
+    print(f"\n已保存到: {OUTPUT_PATH}")
+    print(f"总链接数: {len(df)}")
+
+
+if __name__ == "__main__":
+    main()
