@@ -1,0 +1,93 @@
+import requests
+import pandas as pd
+import time
+import os
+
+# ========= 项目路径 =========
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RAW_DIR = os.path.join(BASE_DIR, "data", "raw")
+
+os.makedirs(RAW_DIR, exist_ok=True)
+
+# ========= API KEY（从环境变量读取） =========
+API_KEY = os.getenv("YOUTUBE_API_KEY")
+
+if not API_KEY:
+    raise ValueError("请先设置 YOUTUBE_API_KEY 环境变量")
+
+# ========= 输出路径 =========
+OUTPUT_PATH = os.path.join(RAW_DIR, "youtube_videos_raw.csv")
+
+# ========= KEYWORDS =========
+KEYWORDS = [
+    "medical tourism",
+    "treatment abroad",
+    "cancer screening abroad",
+    "health check abroad",
+    "PET scan abroad",
+    "international patient hospital"
+]
+
+MAX_RESULTS_PER_QUERY = 20
+
+
+def search_videos(query, api_key, max_results=20):
+    url = "https://www.googleapis.com/youtube/v3/search"
+    params = {
+        "part": "snippet",
+        "q": query,
+        "type": "video",
+        "maxResults": max_results,
+        "key": api_key
+    }
+
+    resp = requests.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    rows = []
+
+    for item in data.get("items", []):
+        video_id = item["id"]["videoId"]
+        snippet = item["snippet"]
+
+        rows.append({
+            "platform": "youtube",
+            "query": query,
+            "video_id": video_id,
+            "title": snippet.get("title", ""),
+            "description": snippet.get("description", ""),
+            "channel": snippet.get("channelTitle", ""),
+            "published_at": snippet.get("publishedAt", ""),
+            "video_url": f"https://www.youtube.com/watch?v={video_id}"
+        })
+
+    return rows
+
+
+def main():
+    print("开始抓取 YouTube 视频...")
+
+    all_rows = []
+
+    for q in KEYWORDS:
+        print(f"\n搜索关键词: {q}")
+        try:
+            rows = search_videos(q, API_KEY, MAX_RESULTS_PER_QUERY)
+            all_rows.extend(rows)
+            print(f"抓到 {len(rows)} 条")
+        except Exception as e:
+            print(f"失败: {e}")
+
+        time.sleep(1)
+
+    df = pd.DataFrame(all_rows).drop_duplicates(subset=["video_id"])
+
+    df.to_csv(OUTPUT_PATH, index=False, encoding="utf-8-sig")
+
+    print(f"\n完成，已保存到: {OUTPUT_PATH}")
+    print(f"总视频数: {len(df)}")
+
+
+if __name__ == "__main__":
+    main()
