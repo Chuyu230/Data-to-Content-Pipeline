@@ -1,0 +1,192 @@
+#因为自动打开浏览器登录x登录不上去，所以采用了复用浏览器的方式
+#在开始运行之前，通过终端打开浏览器
+
+
+import time
+import random
+import pandas as pd
+from urllib.parse import quote
+import os
+
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+
+# ========= 项目路径 =========
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RAW_DIR = os.path.join(BASE_DIR, "data", "raw")
+PROGRESS_DIR = os.path.join(RAW_DIR, "progress")
+
+os.makedirs(RAW_DIR, exist_ok=True)
+os.makedirs(PROGRESS_DIR, exist_ok=True)
+
+# ========= CONFIG =========
+MAX_POSTS = 2000
+OUTPUT_CSV = os.path.join(RAW_DIR, "x_posts_raw.csv")
+
+# ========= KEYWORDS =========
+KEYWORDS = [
+    "medical tourism",
+    "plastic surgery abroad",
+    "IVF abroad",
+    "dentist abroad",
+    "healthcare abroad"
+]
+
+
+def check_login(driver):
+    print("[+] 检查当前浏览器是否已登录 X...")
+    driver.get("https://x.com/home")
+    time.sleep(3)
+
+    current_url = driver.current_url.lower()
+
+    if "login" in current_url or "signup" in current_url:
+        print("[!] 未登录，请先手动登录 X")
+        return False
+
+    print("[+] 已检测到登录状态")
+    return True
+
+
+def search_and_collect(driver, keyword, max_posts_per_keyword):
+    posts_collected = []
+    seen_ids = set()
+
+    print(f"[+] 打开搜索页面: {keyword}")
+
+    query = f'"{keyword}" lang:en -is:retweet'
+    url = f"https://x.com/search?q={quote(query)}&src=typed_query&f=live"
+
+    driver.get(url)
+    time.sleep(5)
+
+    collected = 0
+    attempts_without_new = 0
+
+    while collected < max_posts_per_keyword and attempts_without_new < 6:
+        posts = driver.find_elements(By.XPATH, '//article[@role="article"]')
+
+        if not posts:
+            print("[!] 当前页面没有找到 post 元素")
+            break
+
+        pre_count = len(seen_ids)
+
+        for post in posts:
+            try:
+                user = ""
+                text = ""
+                created_at = ""
+
+                try:
+                    user = post.find_element(By.XPATH, './/span[contains(text(), "@")]').text
+                except:
+                    pass
+
+                try:
+                    text = post.find_element(By.XPATH, './/div[@data-testid="tweetText"]').text
+                except:
+                    try:
+                        text = post.find_element(By.XPATH, './/div[@lang]').text
+                    except:
+                        continue
+
+                try:
+                    created_at = post.find_element(By.XPATH, './/time').get_attribute("datetime")
+                except:
+                    created_at = time.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+                post_id = f"{user}_{created_at}"
+
+                if post_id in seen_ids:
+                    continue
+
+                seen_ids.add(post_id)
+                clean_text = " ".join(text.split())
+
+                posts_collected.append({
+                    "platform": "x",
+                    "query": keyword,
+                    "user": user,
+                    "text": clean_text,
+                    "created_at": created_at
+                })
+
+                collected += 1
+                print(f"[{keyword}] {collected}: {clean_text[:80]}")
+
+                if collected >= max_posts_per_keyword:
+                    break
+
+            except Exception:
+                continue
+
+        print(f"[+] {keyword}: Collected {collected}/{max_posts_per_keyword}")
+
+        driver.execute_script("window.scrollBy(0, 2000);")
+        time.sleep(random.uniform(2, 4))
+
+        if len(seen_ids) == pre_count:
+            attempts_without_new += 1
+        else:
+            attempts_without_new = 0
+
+    return posts_collected
+
+
+def main():
+    print("请确保：已手动打开 Chrome，开启 9222 端口，并已登录 X")
+
+    all_posts = []
+    posts_per_keyword = MAX_POSTS // len(KEYWORDS)
+    if posts_per_keyword < 50:
+        posts_per_keyword = 50
+
+    options = webdriver.ChromeOptions()
+    options.debugger_address = "127.0.0.1:9222"
+
+    print("[+] 正在连接已打开的 Chrome 浏览器...")
+    driver = webdriver.Chrome(options=options)
+    wait = WebDriverWait(driver, 15)
+
+    try:
+        if not check_login(driver):
+            return
+
+        print("[+] 开始爬取...\n")
+        random.shuffle(KEYWORDS)
+
+        for i, keyword in enumerate(KEYWORDS):
+            print(f"\n[{i+1}/{len(KEYWORDS)}] 关键词: {keyword}")
+
+            posts = search_and_collect(driver, keyword, posts_per_keyword)
+            all_posts.extend(posts)
+
+            if all_posts:
+                pd.DataFrame(all_posts).to_csv(
+                    os.path.join(PROGRESS_DIR, f"x_progress_{i+1}.csv"),
+                    index=False,
+                    encoding="utf-8-sig"
+                )
+
+            time.sleep(random.uniform(3, 6))
+
+        if all_posts:
+            df = pd.DataFrame(all_posts)
+            df.drop_duplicates(subset=["user", "created_at"], inplace=True)
+            df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+
+            print(f"\n[✓] 完成！共 {len(df)} 条 -> {OUTPUT_CSV}")
+        else:
+            print("[!] 没有抓到数据")
+
+    except Exception as e:
+        print(f"[!] 程序异常: {e}")
+
+    finally:
+        print("[+] 脚本结束（浏览器保持打开）")
+
+
+if __name__ == "__main__":
+    main()
