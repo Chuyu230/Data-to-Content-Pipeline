@@ -1,0 +1,378 @@
+#半自动分发脚本（完整版）
+#作用：
+#1. prepare  : 从 deepseek_generated_posts.csv 和 final_creatives 中生成发布队列 publish_queue.csv
+#2. export   : 导出各平台可直接发布的内容到 publish_ready/
+#3. summary  : 汇总当前发布状态
+#4. mark     : 标记某条内容为 posted / failed / ready / pending / approved / rejected
+
+import argparse
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import pandas as pd
+
+QUEUE_COLUMNS = [
+    "id", "platform", "language", "category", "audience",
+    "title", "hook", "body", "cta", "hashtags", "caption",
+    "image_path", "scheduled_time", "status", "review_status",
+    "publish_note", "publish_url", "retry_count", "created_at", "updated_at",
+]
+
+VALID_STATUS = {"pending", "ready", "posted", "failed"}
+VALID_REVIEW = {"draft", "approved", "rejected"}
+PLATFORM_ORDER = ["x", "instagram", "facebook"]
+
+
+def now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def project_root_from_script() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def content_dir_from_root(project_root: Path) -> Path:
+    return project_root / "content"
+
+
+def deepseek_csv_path(project_root: Path) -> Path:
+    return content_dir_from_root(project_root) / "deepseek_generated_posts.csv"
+
+
+def publish_queue_path(project_root: Path) -> Path:
+    return content_dir_from_root(project_root) / "publish_queue.csv"
+
+
+def publish_ready_dir(project_root: Path) -> Path:
+    return content_dir_from_root(project_root) / "publish_ready"
+
+
+def final_creatives_root(project_root: Path) -> Path:
+    return content_dir_from_root(project_root) / "final_creatives"
+
+
+def safe_text(x) -> str:
+    if x is None:
+        return ""
+    try:
+        if pd.isna(x):
+            return ""
+    except Exception:
+        pass
+    return str(x).strip()
+
+
+def ensure_queue_columns(df: pd.DataFrame) -> pd.DataFrame:
+    for col in QUEUE_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    return df[QUEUE_COLUMNS].copy()
+
+
+def format_caption_for_platform(row: pd.Series) -> str:
+    platform = safe_text(row.get("platform")).lower()
+    title = safe_text(row.get("title"))
+    hook = safe_text(row.get("hook"))
+    body = safe_text(row.get("body"))
+    cta = safe_text(row.get("cta"))
+    hashtags = safe_text(row.get("hashtags"))
+
+    if platform == "x":
+        parts = [p for p in [title, hook, cta] if p]
+        if hashtags:
+            parts.append(" ".join(hashtags.split()[:2]))
+        caption = "\n\n".join(parts)
+        if len(caption) > 260:
+            short_body = (body[:120].rstrip() + "...") if len(body) > 123 else body
+            parts = [p for p in [title, hook, short_body, cta] if p]
+            if hashtags:
+                parts.append(" ".join(hashtags.split()[:2]))
+            caption = "\n\n".join(parts)
+
+    elif platform == "instagram":
+        parts = [p for p in [title, hook, body, cta, hashtags] if p]
+        caption = "\n\n".join(parts)
+
+    else:
+        parts = [p for p in [title, hook, body, cta] if p]
+        if hashtags:
+            parts.append(" ".join(hashtags.split()[:3]))
+        caption = "\n\n".join(parts)
+
+    return caption.strip()
+
+
+def find_best_image_path(project_root: Path, row: pd.Series) -> str:
+    for col in ["layout_path", "image_path"]:
+        p = safe_text(row.get(col))
+        if p:
+            full = project_root / p
+            if full.exists():
+                return str(Path(p).as_posix())
+
+    platform = safe_text(row.get("platform")).lower()
+    language = safe_text(row.get("language")).lower() or "en"
+    category = safe_text(row.get("category")).lower()
+    root = final_creatives_root(project_root) / platform
+    if root.exists():
+        patterns = [
+            f"*_{platform}_{category}_{language}_layout.png",
+            f"*{category}*{language}*_layout.png",
+            "*.png",
+        ]
+        for pattern in patterns:
+            matches = sorted(root.glob(pattern))
+            if matches:
+                return str(matches[0].relative_to(project_root).as_posix())
+    return ""
+
+
+def load_generated_posts(project_root: Path) -> pd.DataFrame:
+    path = deepseek_csv_path(project_root)
+    if not path.exists():
+        raise FileNotFoundError(f"未找到生成内容文件：{path}")
+    return pd.read_csv(path)
+
+
+def load_queue_or_empty(project_root: Path) -> pd.DataFrame:
+    path = publish_queue_path(project_root)
+    if path.exists():
+        return ensure_queue_columns(pd.read_csv(path))
+    return ensure_queue_columns(pd.DataFrame(columns=QUEUE_COLUMNS))
+
+
+def save_queue(project_root: Path, df: pd.DataFrame) -> Path:
+    path = publish_queue_path(project_root)
+    ensure_queue_columns(df).to_csv(path, index=False, encoding="utf-8-sig")
+    return path
+
+
+def build_queue_from_generated(project_root: Path, generated_df: pd.DataFrame) -> pd.DataFrame:
+    rows: List[Dict] = []
+    ts = now_str()
+
+    for idx, row in generated_df.iterrows():
+        queue_row = {
+            "id": idx + 1,
+            "platform": safe_text(row.get("platform")).lower(),
+            "language": safe_text(row.get("language")),
+            "category": safe_text(row.get("category")),
+            "audience": safe_text(row.get("audience")),
+            "title": safe_text(row.get("title")),
+            "hook": safe_text(row.get("hook")),
+            "body": safe_text(row.get("body")),
+            "cta": safe_text(row.get("cta")),
+            "hashtags": safe_text(row.get("hashtags")),
+            "caption": "",
+            "image_path": find_best_image_path(project_root, row),
+            "scheduled_time": "",
+            "status": "pending",
+            "review_status": "draft",
+            "publish_note": "",
+            "publish_url": "",
+            "retry_count": 0,
+            "created_at": ts,
+            "updated_at": ts,
+        }
+        queue_row["caption"] = format_caption_for_platform(pd.Series(queue_row))
+        rows.append(queue_row)
+
+    return ensure_queue_columns(pd.DataFrame(rows))
+
+
+def merge_queue(existing_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
+    if existing_df.empty:
+        out = new_df.copy()
+        out["id"] = range(1, len(out) + 1)
+        return ensure_queue_columns(out)
+
+    existing_df = ensure_queue_columns(existing_df)
+    new_df = ensure_queue_columns(new_df)
+
+    existing_df["_key"] = (
+        existing_df["platform"].astype(str).str.lower()
+        + "||" + existing_df["language"].astype(str).str.lower()
+        + "||" + existing_df["title"].astype(str).str.strip()
+    )
+    new_df["_key"] = (
+        new_df["platform"].astype(str).str.lower()
+        + "||" + new_df["language"].astype(str).str.lower()
+        + "||" + new_df["title"].astype(str).str.strip()
+    )
+
+    existing_map = {k: i for i, k in enumerate(existing_df["_key"].tolist())}
+    used_existing = set()
+    merged_rows = []
+
+    for _, new_row in new_df.iterrows():
+        key = new_row["_key"]
+        if key in existing_map:
+            old_row = existing_df.iloc[existing_map[key]].copy()
+            used_existing.add(existing_map[key])
+            for col in ["platform", "language", "category", "audience", "title", "hook", "body", "cta", "hashtags", "caption", "image_path"]:
+                old_row[col] = new_row[col]
+            old_row["updated_at"] = now_str()
+            merged_rows.append(old_row.drop(labels=["_key"]))
+        else:
+            merged_rows.append(new_row.drop(labels=["_key"]))
+
+    for i, row in existing_df.iterrows():
+        if i not in used_existing:
+            merged_rows.append(row.drop(labels=["_key"]))
+
+    out = pd.DataFrame(merged_rows).reset_index(drop=True)
+    out = ensure_queue_columns(out)
+    out["id"] = range(1, len(out) + 1)
+    return out
+
+
+def prepare_queue(project_root: Path) -> Path:
+    generated_df = load_generated_posts(project_root)
+    new_df = build_queue_from_generated(project_root, generated_df)
+    existing_df = load_queue_or_empty(project_root)
+    final_df = merge_queue(existing_df, new_df)
+    return save_queue(project_root, final_df)
+
+
+def export_publish_files(project_root: Path) -> Dict[str, Path]:
+    queue_df = load_queue_or_empty(project_root)
+    ready_dir = publish_ready_dir(project_root)
+    ready_dir.mkdir(parents=True, exist_ok=True)
+
+    approved_df = queue_df[
+        (queue_df["review_status"].astype(str) == "approved")
+        & (queue_df["status"].astype(str).isin(["ready", "pending"]))
+    ].copy()
+
+    if approved_df.empty:
+        approved_df = queue_df[queue_df["review_status"].astype(str) == "approved"].copy()
+
+    out_paths = {}
+    for platform in PLATFORM_ORDER:
+        sub = approved_df[approved_df["platform"].astype(str).str.lower() == platform].copy()
+        if sub.empty:
+            sub = pd.DataFrame(columns=[
+                "id", "platform", "language", "category", "title", "caption",
+                "image_path", "status", "review_status", "scheduled_time",
+                "publish_note", "publish_url"
+            ])
+        else:
+            sub["caption"] = sub.apply(format_caption_for_platform, axis=1)
+            sub = sub[
+                ["id", "platform", "language", "category", "title", "caption",
+                 "image_path", "status", "review_status", "scheduled_time",
+                 "publish_note", "publish_url"]
+            ]
+        out_path = ready_dir / f"{platform}_posts.csv"
+        sub.to_csv(out_path, index=False, encoding="utf-8-sig")
+        out_paths[platform] = out_path
+    return out_paths
+
+
+def summary_queue(project_root: Path) -> str:
+    df = load_queue_or_empty(project_root)
+    if df.empty:
+        return "发布队列为空。"
+
+    lines = [f"总条数：{len(df)}"]
+    for platform in PLATFORM_ORDER:
+        sub = df[df["platform"].astype(str).str.lower() == platform]
+        if sub.empty:
+            continue
+        lines.append(f"\n平台：{platform}（{len(sub)} 条）")
+        status_count = sub["status"].astype(str).value_counts().to_dict()
+        review_count = sub["review_status"].astype(str).value_counts().to_dict()
+        lines.append("  状态：")
+        for k in ["pending", "ready", "posted", "failed"]:
+            lines.append(f"    {k}: {status_count.get(k, 0)}")
+        lines.append("  审核：")
+        for k in ["draft", "approved", "rejected"]:
+            lines.append(f"    {k}: {review_count.get(k, 0)}")
+    return "\n".join(lines)
+
+
+def mark_queue_item(project_root: Path, item_id: int, status: Optional[str], review_status: Optional[str], note: Optional[str], publish_url: Optional[str]) -> Path:
+    df = load_queue_or_empty(project_root)
+    if df.empty:
+        raise ValueError("发布队列为空，无法标记。")
+
+    mask = df["id"].astype(int) == int(item_id)
+    if not mask.any():
+        raise ValueError(f"未找到 id={item_id} 的记录。")
+
+    idx = df.index[mask][0]
+
+    if status is not None:
+        status = status.strip().lower()
+        if status not in VALID_STATUS:
+            raise ValueError(f"status 必须是：{sorted(VALID_STATUS)}")
+        df.at[idx, "status"] = status
+        if status == "failed":
+            try:
+                df.at[idx, "retry_count"] = int(df.at[idx, "retry_count"]) + 1
+            except Exception:
+                df.at[idx, "retry_count"] = 1
+
+    if review_status is not None:
+        review_status = review_status.strip().lower()
+        if review_status not in VALID_REVIEW:
+            raise ValueError(f"review_status 必须是：{sorted(VALID_REVIEW)}")
+        df.at[idx, "review_status"] = review_status
+
+    if note is not None:
+        df.at[idx, "publish_note"] = note
+
+    if publish_url is not None:
+        df.at[idx, "publish_url"] = publish_url
+
+    if str(df.at[idx, "review_status"]).lower() == "approved" and str(df.at[idx, "status"]).lower() == "pending":
+        df.at[idx, "status"] = "ready"
+
+    df.at[idx, "updated_at"] = now_str()
+    return save_queue(project_root, df)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="半自动分发脚本")
+    parser.add_argument("mode", choices=["prepare", "export", "summary", "mark"], help="操作模式")
+    parser.add_argument("--project-root", default=None, help="项目根目录。默认自动识别。")
+    parser.add_argument("--id", type=int, help="用于 mark 模式")
+    parser.add_argument("--status", help="用于 mark：pending/ready/posted/failed")
+    parser.add_argument("--review-status", help="用于 mark：draft/approved/rejected")
+    parser.add_argument("--note", help="用于 mark：备注")
+    parser.add_argument("--publish-url", help="用于 mark：发布链接")
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    project_root = Path(args.project_root).resolve() if args.project_root else project_root_from_script()
+
+    if args.mode == "prepare":
+        out = prepare_queue(project_root)
+        print(f"已生成发布队列：{out}")
+    elif args.mode == "export":
+        out_paths = export_publish_files(project_root)
+        print("已导出各平台待发布文件：")
+        for platform, path in out_paths.items():
+            print(f"- {platform}: {path}")
+    elif args.mode == "summary":
+        print(summary_queue(project_root))
+    elif args.mode == "mark":
+        if args.id is None:
+            raise ValueError("mark 模式必须提供 --id")
+        out = mark_queue_item(
+            project_root=project_root,
+            item_id=args.id,
+            status=args.status,
+            review_status=args.review_status,
+            note=args.note,
+            publish_url=args.publish_url,
+        )
+        print(f"已更新发布队列：{out}")
+
+
+if __name__ == "__main__":
+    main()
