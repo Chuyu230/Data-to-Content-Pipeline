@@ -1,0 +1,149 @@
+import pandas as pd
+import re
+import os
+
+# ========= 项目路径 =========
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RAW_DIR = os.path.join(BASE_DIR, "data", "raw")
+CLEANED_DIR = os.path.join(BASE_DIR, "data", "cleaned")
+
+os.makedirs(CLEANED_DIR, exist_ok=True)
+
+# ========= 输入输出路径 =========
+REDDIT_PATH = os.path.join(RAW_DIR, "reddit_posts_content.csv")
+X_PATH = os.path.join(RAW_DIR, "x_posts_raw.csv")
+YOUTUBE_PATH = os.path.join(RAW_DIR, "youtube_comments_raw.csv")
+
+OUTPUT_PATH = os.path.join(CLEANED_DIR, "all_platforms_cleaned.csv")
+
+
+# ========= 清洗函数 =========
+def clean_text(text):
+    if pd.isna(text):
+        return ""
+
+    text = str(text)
+
+    # 去 URL
+    text = re.sub(r"http\S+", "", text)
+
+    # 去 @ 和 #
+    text = re.sub(r"@\w+", "", text)
+    text = re.sub(r"#\w+", "", text)
+
+    # Reddit / 通用噪音
+    text = re.sub(r"\[已删除\]", "", text)
+    text = re.sub(r"\d+年前", "", text)
+    text = re.sub(r"共享|回复|更多回复", "", text)
+
+    # 去奇怪符号
+    text = re.sub(r"[^\w\s]", " ", text)
+
+    # 多空格
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
+
+
+# ========= 主流程 =========
+def main():
+    all_data = []
+
+    # ===== Reddit =====
+    try:
+        reddit = pd.read_csv(REDDIT_PATH)
+
+        reddit["platform"] = "reddit"
+
+        reddit["text"] = (
+            reddit["title"].fillna("").astype(str) + " " +
+            reddit["body"].fillna("").astype(str) + " " +
+            reddit["comments"].fillna("").astype(str)
+        )
+
+        if "query" not in reddit.columns:
+            reddit["query"] = ""
+
+        reddit = reddit[["platform", "query", "text"]]
+
+        all_data.append(reddit)
+
+        print("Reddit 加载成功:", len(reddit))
+
+    except Exception as e:
+        print("Reddit 失败:", e)
+
+    # ===== X =====
+    try:
+        x_df = pd.read_csv(X_PATH)
+
+        x_df["platform"] = "x"
+
+        if "text" not in x_df.columns:
+            raise ValueError("X 数据中没有 text 列")
+
+        if "query" not in x_df.columns:
+            x_df["query"] = ""
+
+        x_df = x_df[["platform", "query", "text"]]
+
+        all_data.append(x_df)
+
+        print("X 加载成功:", len(x_df))
+
+    except Exception as e:
+        print("X 失败:", e)
+
+    # ===== YouTube =====
+    try:
+        yt = pd.read_csv(YOUTUBE_PATH)
+
+        yt["platform"] = "youtube"
+
+        # 新版脚本建议直接用 text 列；如果还是旧版 comment_text，就兼容一下
+        if "text" in yt.columns:
+            yt["text"] = yt["text"]
+        elif "comment_text" in yt.columns:
+            yt["text"] = yt["comment_text"]
+        else:
+            raise ValueError("YouTube 数据中没有 text/comment_text 列")
+
+        if "query" not in yt.columns:
+            yt["query"] = ""
+
+        yt = yt[["platform", "query", "text"]]
+
+        all_data.append(yt)
+
+        print("YouTube 加载成功:", len(yt))
+
+    except Exception as e:
+        print("YouTube 失败:", e)
+
+    # ===== 合并 =====
+    if not all_data:
+        raise ValueError("没有成功读取任何平台的数据，请检查 data/raw 下的文件")
+
+    df = pd.concat(all_data, ignore_index=True)
+
+    print("\n合并后总条数:", len(df))
+
+    # ===== 清洗 =====
+    df["text_clean"] = df["text"].apply(clean_text)
+
+    # 去空
+    df = df[df["text_clean"].str.len() > 20].copy()
+
+    # 去重
+    df = df.drop_duplicates(subset=["text_clean"]).copy()
+
+    print("清洗后条数:", len(df))
+
+    # 保存
+    df.to_csv(OUTPUT_PATH, index=False, encoding="utf-8-sig")
+
+    print("\n✅ 完成！输出文件:", OUTPUT_PATH)
+
+
+if __name__ == "__main__":
+    main()
