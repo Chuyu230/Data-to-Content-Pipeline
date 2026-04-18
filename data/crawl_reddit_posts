@@ -1,0 +1,143 @@
+from playwright.sync_api import sync_playwright
+import pandas as pd
+import re
+import os
+
+# ========= 项目路径 =========
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+INPUT_PATH = os.path.join(BASE_DIR, "data", "raw", "reddit_post_links.csv")
+OUTPUT_PATH = os.path.join(BASE_DIR, "data", "raw", "reddit_posts_content.csv")
+
+
+def clean_text(text):
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def try_get_text(locator):
+    try:
+        if locator.count() > 0:
+            return clean_text(locator.first.inner_text())
+    except:
+        pass
+    return ""
+
+
+def extract_post_data(page, url, query=""):
+    print(f"\n抓取帖子: {url}")
+
+    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(4000)
+
+    # 关闭可能的弹窗
+    try:
+        page.keyboard.press("Escape")
+    except:
+        pass
+
+    # 标题
+    title = try_get_text(page.locator("h1"))
+
+    # 正文
+    body = ""
+    body_selectors = [
+        "div[data-click-id='text']",
+        "div[slot='text-body']",
+        "shreddit-post",
+        "article"
+    ]
+
+    for selector in body_selectors:
+        body = try_get_text(page.locator(selector))
+        if body and body != title:
+            break
+
+    # 评论
+    comments = []
+    comment_selectors = [
+        "div[data-testid='comment']",
+        "shreddit-comment",
+        "faceplate-comment"
+    ]
+
+    for selector in comment_selectors:
+        loc = page.locator(selector)
+        count = loc.count()
+
+        if count > 0:
+            count = min(count, 15)
+
+            for i in range(count):
+                try:
+                    txt = clean_text(loc.nth(i).inner_text())
+                    if txt and len(txt) > 20:
+                        comments.append(txt)
+                except:
+                    pass
+
+            if comments:
+                break
+
+    return {
+        "query": query,
+        "post_url": url,
+        "title": title,
+        "body": body,
+        "comments": " ||| ".join(comments),
+        "comment_count": len(comments)
+    }
+
+
+def main():
+    print("请确保：已登录 Reddit")
+
+    if not os.path.exists(INPUT_PATH):
+        raise FileNotFoundError(f"找不到输入文件: {INPUT_PATH}")
+
+    df_links = pd.read_csv(INPUT_PATH)
+    results = []
+
+    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+        context = browser.contexts[0]
+        page = context.pages[0] if context.pages else context.new_page()
+
+        for idx, row in df_links.iterrows():
+            try:
+                data = extract_post_data(
+                    page=page,
+                    url=row["post_url"],
+                    query=row.get("query", "")
+                )
+                results.append(data)
+
+                print(f"完成 {idx + 1}/{len(df_links)}")
+                print("标题:", data["title"][:60])
+
+            except Exception as e:
+                print(f"失败: {row['post_url']} -> {e}")
+                results.append({
+                    "query": row.get("query", ""),
+                    "post_url": row["post_url"],
+                    "title": "",
+                    "body": "",
+                    "comments": "",
+                    "comment_count": 0
+                })
+
+            # 每抓一个保存一次，防止中断
+            pd.DataFrame(results).to_csv(
+                OUTPUT_PATH,
+                index=False,
+                encoding="utf-8-sig"
+            )
+
+    print(f"\n完成，已保存到: {OUTPUT_PATH}")
+
+
+if __name__ == "__main__":
+    main()
