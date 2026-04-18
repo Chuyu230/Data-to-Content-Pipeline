@@ -1,0 +1,804 @@
+import argparse
+import json
+import logging
+import os
+import random
+import re
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import pandas as pd
+import requests
+from dotenv import load_dotenv
+from openai import OpenAI
+from PIL import Image, ImageDraw, ImageFont
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger(__name__)
+
+PLATFORM_LIMIT = 5
+
+DEFAULT_PLATFORM_RULES = {
+    "x": {
+        "body_style": "short-form, punchy, high-retention, pattern-interrupt opening, clear payoff",
+        "max_chars_hint": "keep it compact enough for fast scrolling and quick comprehension",
+        "aspect_ratio": "16:9",
+        "canvas_size": (1600, 900),
+        "hook_style": "ask a sharp question or introduce a surprising contrast in the first line",
+        "framing_rule": "make it feel timely, concise, and swipe-stopping"
+    },
+    "instagram": {
+        "body_style": "aspirational, visual, polished, emotionally warm, premium lifestyle tone",
+        "max_chars_hint": "caption can be medium length with elegant pacing and strong visual cues",
+        "aspect_ratio": "4:5",
+        "canvas_size": (1080, 1350),
+        "hook_style": "open with an emotional or visually rich line that makes the reader pause",
+        "framing_rule": "make it feel premium, visual, and save-worthy"
+    },
+    "facebook": {
+        "body_style": "trust-building, educational, readable, slightly longer and more explanatory",
+        "max_chars_hint": "allow a fuller explanation while keeping it skimmable and social-native",
+        "aspect_ratio": "1:1",
+        "canvas_size": (1200, 1200),
+        "hook_style": "open with a clear pain point or practical concern international patients often have",
+        "framing_rule": "make it feel useful, reassuring, and discussion-friendly"
+    }
+}
+
+LANGUAGE_NAMES = {"en": "English", "ar": "Arabic", "id": "Bahasa Indonesia", "th": "Thai"}
+
+CATEGORY_TO_ANGLES = {
+    "screening_checkup": [
+        "premium preventive screening in China",
+        "early detection with efficient checkup flow in China",
+        "advanced imaging and high-end health management in China"
+    ],
+    "cost_affordability": [
+        "balancing quality and affordability in China",
+        "high-end care in China with better value",
+        "planned medical travel cost transparency for China"
+    ],
+    "quality_trust": [
+        "why patients trust advanced hospitals in China",
+        "modern specialists and structured care pathways in China",
+        "international patient confidence and hospital quality in China"
+    ],
+    "travel_logistics": [
+        "how medical travel to China can be organized smoothly",
+        "hospital + hotel + translation + city travel coordination in China",
+        "practical trip planning for overseas patients going to China"
+    ],
+    "risk_complications": [
+        "how to reduce uncertainty before traveling to China for care",
+        "what patients should verify before choosing a hospital in China",
+        "planning for safer medical travel to China"
+    ],
+    "insurance_payment": [
+        "payment preparation for international patients going to China",
+        "how to plan self-pay treatment in China",
+        "medical budgeting before travel to China"
+    ],
+    "recovery_followup": [
+        "planning recovery after overseas care in China",
+        "follow-up support after treatment in China",
+        "aftercare and continuity of care after medical travel to China"
+    ]
+}
+
+GENERIC_AUDIENCES = ["Southeast Asia", "Middle East", "English-speaking expats"]
+RISKY_PATTERNS = [
+    r"\bguaranteed\b", r"\b100%\s*safe\b", r"\bzero risk\b", r"\bbest in the world\b",
+    r"\bworld[- ]class\b", r"\btop[- ]tier\b", r"\bleading\b", r"\bbest\b",
+    r"\bno side effects\b", r"\bcure guaranteed\b", r"\bpermanent cure\b",
+    r"\bperfect results\b", r"\binstant cure\b",
+]
+FORBIDDEN_TERMS = [
+    "world-class", "top-tier", "leading", "best", "best in the world",
+    "guaranteed", "100% safe", "zero risk", "no side effects"
+]
+FORBIDDEN_COUNTRIES = [
+    "india", "thailand", "south korea", "singapore", "japan", "malaysia",
+    "turkey", "germany", "usa", "united states", "uk", "united kingdom",
+    "canada", "dubai"
+]
+IMAGE_NEGATIVE = (
+    "no text overlay, no watermark, no logo, no infographic, no poster text, "
+    "no extra fingers, no malformed hands, no duplicate people, not blurry, not deformed, not cropped awkwardly"
+)
+
+@dataclass
+class Config:
+    project_root: Path
+    content_dir: Path
+    max_regen_attempts: int
+    temperature: float
+    text_model: str
+    text_base_url: str
+    text_api_key: str
+    hf_token: str
+    hf_image_model: str
+    hf_timeout: int
+    languages: List[str]
+    platforms: List[str]
+    generate_raw_image: bool
+    generate_layout: bool
+
+def safe_text(x) -> str:
+    if x is None:
+        return ""
+    try:
+        if pd.isna(x):
+            return ""
+    except Exception:
+        pass
+    return str(x).strip()
+
+def detect_text_column(df: pd.DataFrame) -> Optional[str]:
+    for col in ["text_clean", "text", "content", "body"]:
+        if col in df.columns:
+            return col
+    return None
+
+def load_csv_or_empty(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        logger.warning("Missing file: %s", path)
+        return pd.DataFrame()
+    return pd.read_csv(path)
+
+def load_inputs(project_root: Path):
+    promo_user = load_csv_or_empty(project_root / "analyze" / "promo_outputs" / "promo_user.csv")
+    promo_soft = load_csv_or_empty(project_root / "analyze" / "promo_outputs" / "promo_soft.csv")
+    keywords_df = load_csv_or_empty(project_root / "analyze" / "analysis_outputs" / "refined_top_keywords.csv")
+    categories_df = load_csv_or_empty(project_root / "analyze" / "analysis_outputs" / "refined_demand_category_counts.csv")
+    logger.info("Loaded promo_user=%s promo_soft=%s keywords=%s categories=%s", len(promo_user), len(promo_soft), len(keywords_df), len(categories_df))
+    return promo_user, promo_soft, keywords_df, categories_df
+
+def sample_reference_texts(dfs: List[pd.DataFrame], n: int = 3, min_len: int = 40, max_len: int = 280) -> List[str]:
+    pool = []
+    for df in dfs:
+        if df.empty:
+            continue
+        col = detect_text_column(df)
+        if not col:
+            continue
+        for t in df[col].dropna().tolist():
+            t = safe_text(t)
+            if min_len <= len(t) <= max_len:
+                pool.append(t)
+    random.shuffle(pool)
+    return pool[:n]
+
+def pick_keyword_column(df: pd.DataFrame) -> Optional[str]:
+    for col in ["keyword", "keywords", "term", "top_keyword"]:
+        if col in df.columns:
+            return col
+    return df.columns[0] if len(df.columns) > 0 else None
+
+def pick_category_column(df: pd.DataFrame) -> Optional[str]:
+    for col in ["category", "demand_category", "label"]:
+        if col in df.columns:
+            return col
+    return df.columns[0] if len(df.columns) > 0 else None
+
+def pick_keywords_by_category(category: str, keywords_df: pd.DataFrame, topn: int = 5) -> List[str]:
+    if keywords_df.empty:
+        return []
+    kw_col = pick_keyword_column(keywords_df)
+    if not kw_col:
+        return []
+    keywords = [safe_text(x) for x in keywords_df[kw_col].dropna().tolist() if safe_text(x)]
+    heuristic_map = {
+        "screening_checkup": ["screen", "check", "scan", "mri", "ct", "pet", "test"],
+        "cost_affordability": ["cost", "price", "cheap", "afford", "budget", "value"],
+        "quality_trust": ["quality", "trust", "safe", "specialist", "hospital", "doctor"],
+        "travel_logistics": ["travel", "visa", "hotel", "trip", "flight", "translation"],
+        "risk_complications": ["risk", "complication", "surgery", "safety"],
+        "insurance_payment": ["insurance", "pay", "payment", "claim"],
+        "recovery_followup": ["recovery", "follow", "aftercare", "rehab"]
+    }
+    seeds = heuristic_map.get(category, [])
+    matched = []
+    for kw in keywords:
+        low = kw.lower()
+        if any(seed in low for seed in seeds):
+            matched.append(kw)
+    if len(matched) < topn:
+        for kw in keywords:
+            if kw not in matched:
+                matched.append(kw)
+            if len(matched) >= topn:
+                break
+    return matched[:topn]
+
+def build_prompt_bank(promo_user, promo_soft, keywords_df, categories_df, platforms, languages) -> pd.DataFrame:
+    cat_col = pick_category_column(categories_df)
+    if cat_col and not categories_df.empty:
+        categories = [safe_text(x) for x in categories_df[cat_col].dropna().tolist() if safe_text(x)]
+    else:
+        categories = list(CATEGORY_TO_ANGLES.keys())
+    rows = []
+    for platform in platforms:
+        count = 0
+        for category in categories:
+            if count >= PLATFORM_LIMIT:
+                break
+            for language in languages:
+                if count >= PLATFORM_LIMIT:
+                    break
+                rows.append({
+                    "platform": platform,
+                    "language": language,
+                    "category": category,
+                    "audience": random.choice(GENERIC_AUDIENCES),
+                    "angle": random.choice(CATEGORY_TO_ANGLES.get(category, [f"{category} content angle in China"])),
+                    "keywords": ", ".join(pick_keywords_by_category(category, keywords_df, topn=5)),
+                    "reference_examples": "\n---\n".join(sample_reference_texts([promo_user, promo_soft], n=3))
+                })
+                count += 1
+    return pd.DataFrame(rows)
+
+def system_prompt() -> str:
+    return """You are a senior healthcare growth strategist, ad copywriter, and creative director.
+
+You are creating marketing content ONLY about overseas users coming to China for:
+- high-end health screening in China
+- medical treatment in China
+- medical tourism in China
+
+Non-negotiable geographic rule:
+- The destination country must always be China.
+- Never mention any country other than China by name.
+
+Creative goal:
+- make each asset feel like premium healthcare advertising, not a hospital brochure
+- combine trust, emotional relief, aspirational lifestyle, and practical clarity
+- make visuals feel cinematic, polished, modern, and commercially useful
+
+Text rules:
+- strong hook
+- platform-specific framing
+- natural CTA
+- no miracle claims
+- no unsupported superlatives
+- do not use: world-class, top-tier, leading, best, guaranteed, 100% safe, zero risk, no side effects
+
+Return valid JSON only with this schema:
+{
+  "title": "...",
+  "visual_headline": "...",
+  "hook": "...",
+  "body": "...",
+  "cta": "...",
+  "hashtags": ["#...", "#...", "#..."],
+  "image_prompt": "...",
+  "image_prompt_structured": {
+    "scene": "...",
+    "subject": "...",
+    "environment": "...",
+    "lighting": "...",
+    "style": "...",
+    "composition": "...",
+    "aspect_ratio": "..."
+  },
+  "content_angle_summary": "..."
+}
+"""
+
+def make_user_prompt(row: Dict) -> str:
+    rule = DEFAULT_PLATFORM_RULES[row["platform"]]
+    language_name = LANGUAGE_NAMES.get(row["language"], row["language"])
+    return f"""
+Create ONE premium ad-style social media asset package.
+
+Target:
+- Destination country: China
+- Platform: {row["platform"]}
+- Language: {language_name}
+- Audience: {row["audience"]}
+- Demand category: {row["category"]}
+- Content angle: {row["angle"]}
+- Important keywords to weave in naturally: {row["keywords"]}
+
+Platform rules:
+- Hook style: {rule["hook_style"]}
+- Body style: {rule["body_style"]}
+- Length hint: {rule["max_chars_hint"]}
+- Platform framing rule: {rule["framing_rule"]}
+- Preferred image aspect ratio: {rule["aspect_ratio"]}
+
+Hard constraints:
+- Never mention any country other than China.
+- Do not use these terms: {", ".join(FORBIDDEN_TERMS)}.
+- Make the title and visual_headline platform-specific.
+- CTA should be plain ad-copy text, not a button label.
+
+Platform distinctions:
+- X should feel like a strong, high-contrast information-led campaign visual.
+- Instagram should feel like a magazine-cover or luxury wellness campaign visual with fewer words.
+- Facebook should feel like a trust-building informative social card with strong readability.
+
+Ad-style image requirements:
+- The image must feel like premium editorial advertising.
+- Include emotional payoff, not just a static waiting room.
+- Prefer scenes such as patient relief, guided care, reassuring consultation, smooth premium journey in China.
+- Avoid generic stock-photo stiffness.
+
+Tone references for rhythm only. Do NOT copy wording:
+{row["reference_examples"]}
+""".strip()
+
+class DeepSeekClient:
+    def __init__(self, api_key: str, base_url: str, model: str, temperature: float):
+        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        self.model = model
+        self.temperature = temperature
+
+    def _extract_json(self, text: str) -> Dict:
+        text = text.strip()
+        try:
+            return json.loads(text)
+        except Exception:
+            match = re.search(r"\{.*\}", text, flags=re.S)
+            if match:
+                return json.loads(match.group(0))
+        raise ValueError("Model response is not valid JSON")
+
+    def chat_json(self, sys_prompt: str, user_prompt: str, retries: int = 3, backoff: float = 2.0) -> Dict:
+        last_err = None
+        for attempt in range(1, retries + 1):
+            try:
+                resp = self.client.chat.completions.create(
+                    model=self.model,
+                    temperature=self.temperature,
+                    response_format={"type": "json_object"},
+                    messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}],
+                )
+                return self._extract_json(resp.choices[0].message.content or "{}")
+            except Exception as e:
+                last_err = e
+                msg = str(e)
+                logger.warning("Text generation failed on attempt %s/%s: %s", attempt, retries, msg)
+                if "Insufficient Balance" in msg or "insufficient_quota" in msg or "402" in msg:
+                    raise RuntimeError(f"Stop generation due to billing/quota issue: {msg}") from e
+                if attempt < retries:
+                    time.sleep(backoff ** attempt)
+        raise RuntimeError(f"DeepSeek request failed after retries: {last_err}")
+
+def find_forbidden_countries(text: str) -> List[str]:
+    low = safe_text(text).lower()
+    return [name for name in FORBIDDEN_COUNTRIES if re.search(rf"\b{re.escape(name)}\b", low)]
+
+def check_compliance(text: str) -> List[str]:
+    low = safe_text(text).lower()
+    return [pattern for pattern in RISKY_PATTERNS if re.search(pattern, low)]
+
+def normalize_output(raw: Dict, row: Dict) -> Dict:
+    hashtags = raw.get("hashtags") or []
+    hashtags_text = " ".join(str(x).strip() for x in hashtags if str(x).strip()) if isinstance(hashtags, list) else safe_text(hashtags)
+    ips = raw.get("image_prompt_structured") if isinstance(raw.get("image_prompt_structured"), dict) else {}
+    item = {
+        "platform": row["platform"],
+        "language": row["language"],
+        "category": row["category"],
+        "audience": row["audience"],
+        "angle": row["angle"],
+        "keywords": row["keywords"],
+        "title": safe_text(raw.get("title")),
+        "visual_headline": safe_text(raw.get("visual_headline")),
+        "hook": safe_text(raw.get("hook")),
+        "body": safe_text(raw.get("body")),
+        "cta": safe_text(raw.get("cta")),
+        "hashtags": hashtags_text,
+        "image_prompt": safe_text(raw.get("image_prompt")),
+        "image_prompt_structured": json.dumps(ips, ensure_ascii=False),
+        "content_angle_summary": safe_text(raw.get("content_angle_summary")),
+        "risk_flags": "",
+        "is_compliance_pass": 1,
+        "image_path": "",
+        "layout_path": "",
+    }
+    combined = " ".join([item["title"], item["visual_headline"], item["hook"], item["body"], item["cta"], item["image_prompt"]])
+    hits = check_compliance(combined)
+    if hits:
+        item["risk_flags"] = "; ".join(hits)
+        item["is_compliance_pass"] = 0
+    return item
+
+def validate_item(item: Dict) -> List[str]:
+    combined = " ".join([
+        safe_text(item.get("title")), safe_text(item.get("visual_headline")), safe_text(item.get("hook")),
+        safe_text(item.get("body")), safe_text(item.get("cta")), safe_text(item.get("image_prompt")),
+        safe_text(item.get("content_angle_summary")), safe_text(item.get("image_prompt_structured"))
+    ])
+    errors = []
+    if find_forbidden_countries(combined):
+        errors.append("forbidden_country")
+    if check_compliance(combined):
+        errors.append("banned_terms")
+    if "china" not in combined.lower():
+        errors.append("missing_china_anchor")
+    if len(safe_text(item.get("visual_headline"))) < 8:
+        errors.append("visual_headline_weak")
+    if len(safe_text(item.get("hook"))) < 12:
+        errors.append("hook_too_weak")
+    if len(safe_text(item.get("body"))) < 80:
+        errors.append("body_too_short")
+    return errors
+
+def build_final_image_prompt(item: Dict) -> str:
+    try:
+        ips = json.loads(item.get("image_prompt_structured") or "{}")
+    except Exception:
+        ips = {}
+    platform_scene = {
+        "x": "a decisive campaign moment with contrast, confidence, and clarity",
+        "instagram": "a refined premium wellness moment with warmth, elegance, and aspiration",
+        "facebook": "a reassuring consultation or guided-care moment that feels practical and trustworthy"
+    }[item["platform"]]
+    pieces = [
+        safe_text(item.get("image_prompt")),
+        safe_text(ips.get("scene")),
+        safe_text(ips.get("subject")),
+        safe_text(ips.get("environment")),
+        safe_text(ips.get("lighting")),
+        safe_text(ips.get("style")),
+        safe_text(ips.get("composition")),
+        platform_scene,
+        "premium editorial healthcare advertising photography in China",
+        "international patient in a premium hospital in Shanghai Beijing or Guangzhou",
+        "emotional tone of trust relief clarity confidence",
+        "East Asian metropolitan premium hospital environment",
+        f"aspect ratio {DEFAULT_PLATFORM_RULES[item['platform']]['aspect_ratio']}",
+        IMAGE_NEGATIVE,
+    ]
+    return ", ".join([p for p in pieces if p])
+
+class HuggingFaceFreeImageClient:
+    def __init__(self, token: str, model: str, timeout: int = 180):
+        if not token:
+            raise ValueError("Missing HF_TOKEN")
+        self.token = token
+        self.model = model
+        self.timeout = timeout
+        self.api_url = f"https://router.huggingface.co/hf-inference/models/{model}"
+
+    def generate(self, prompt: str, out_path: Path, retries: int = 4) -> None:
+        headers = {"Authorization": f"Bearer {self.token}"}
+        payload = {
+            "inputs": prompt,
+            "parameters": {
+                "negative_prompt": IMAGE_NEGATIVE,
+                "num_inference_steps": 20,
+                "guidance_scale": 7.0,
+            }
+        }
+        last_err = None
+        for attempt in range(1, retries + 1):
+            resp = requests.post(self.api_url, headers=headers, json=payload, timeout=self.timeout)
+            ctype = resp.headers.get("content-type", "")
+            if resp.status_code == 200 and ("image/" in ctype or resp.content[:8].startswith(b"\x89PNG")):
+                out_path.write_bytes(resp.content)
+                return
+            text = ""
+            try:
+                text = resp.text[:500]
+            except Exception:
+                pass
+            if resp.status_code in (429, 500, 502, 503, 504):
+                last_err = f"status={resp.status_code} body={text}"
+                wait_s = min(20, 3 * attempt)
+                logger.warning("HF image request retry %s/%s after %ss: %s", attempt, retries, wait_s, last_err)
+                time.sleep(wait_s)
+                continue
+            raise RuntimeError(f"Hugging Face image generation failed: status={resp.status_code} body={text}")
+        raise RuntimeError(f"Hugging Face image generation failed after retries: {last_err}")
+
+def get_font(size: int, bold: bool = False):
+    candidates = []
+    if bold:
+        candidates += ["C:/Windows/Fonts/arialbd.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]
+    else:
+        candidates += ["C:/Windows/Fonts/arial.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
+    for p in candidates:
+        if Path(p).exists():
+            try:
+                return ImageFont.truetype(p, size=size)
+            except Exception:
+                pass
+    return ImageFont.load_default()
+
+def fit_image_cover(img: Image.Image, size: Tuple[int, int]) -> Image.Image:
+    tw, th = size
+    sw, sh = img.size
+    scale = max(tw / sw, th / sh)
+    img = img.resize((max(1, int(sw * scale)), max(1, int(sh * scale))), Image.LANCZOS)
+    left = (img.width - tw) // 2
+    top = (img.height - th) // 2
+    return img.crop((left, top, left + tw, top + th))
+
+def wrap_text(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> List[str]:
+    words = safe_text(text).split()
+    if not words:
+        return []
+    lines, current = [], words[0]
+    for word in words[1:]:
+        test = current + " " + word
+        if draw.textbbox((0, 0), test, font=font)[2] <= max_width:
+            current = test
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
+
+def vertical_gradient_overlay(width: int, height: int, color=(10, 18, 34), alpha_top=0, alpha_bottom=180):
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    px = overlay.load()
+    for y in range(height):
+        a = int(alpha_top + (alpha_bottom - alpha_top) * (y / max(1, height - 1)))
+        for x in range(width):
+            px[x, y] = (*color, a)
+    return overlay
+
+def horizontal_gradient_overlay(width: int, height: int, color=(8, 16, 30), alpha_left=180, alpha_right=20):
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    px = overlay.load()
+    for x in range(width):
+        a = int(alpha_left + (alpha_right - alpha_left) * (x / max(1, width - 1)))
+        for y in range(height):
+            px[x, y] = (*color, a)
+    return overlay
+
+def compose_x_creative(item: Dict, raw_image_path: Path, out_path: Path):
+    width, height = DEFAULT_PLATFORM_RULES["x"]["canvas_size"]
+    bg = fit_image_cover(Image.open(raw_image_path).convert("RGB"), (width, height)).convert("RGBA")
+    bg = Image.alpha_composite(bg, horizontal_gradient_overlay(width, height, color=(7, 16, 30), alpha_left=195, alpha_right=10))
+    draw = ImageDraw.Draw(bg)
+
+    badge_font = get_font(22, bold=False)
+    headline_font = get_font(78, bold=True)
+    hook_font = get_font(30, bold=False)
+    cta_font = get_font(24, bold=False)
+
+    left = 86
+    top = 92
+    max_w = 660
+
+    badge = "CARE IN CHINA"
+    badge_w = draw.textbbox((0, 0), badge, font=badge_font)[2] + 40
+    draw.rounded_rectangle((left, top, left + badge_w, top + 48), radius=18, fill=(255, 255, 255, 228))
+    draw.text((left + 20, top + 12), badge, fill=(19, 40, 84), font=badge_font)
+    y = top + 84
+
+    headline = safe_text(item.get("visual_headline")) or safe_text(item.get("hook"))
+    for line in wrap_text(draw, headline, headline_font, max_w)[:3]:
+        draw.text((left, y), line, fill=(255, 255, 255), font=headline_font)
+        y += headline_font.size + 4
+
+    y += 18
+    for line in wrap_text(draw, safe_text(item.get("hook")), hook_font, max_w)[:4]:
+        draw.text((left, y), line, fill=(225, 232, 244), font=hook_font)
+        y += hook_font.size + 10
+
+    cta = safe_text(item.get("cta"))
+    y = height - 110
+    for line in wrap_text(draw, cta, cta_font, max_w)[:2]:
+        draw.text((left, y), line, fill=(191, 208, 236), font=cta_font)
+        y += cta_font.size + 6
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    bg.convert("RGB").save(out_path)
+
+def compose_instagram_creative(item: Dict, raw_image_path: Path, out_path: Path):
+    width, height = DEFAULT_PLATFORM_RULES["instagram"]["canvas_size"]
+    bg = fit_image_cover(Image.open(raw_image_path).convert("RGB"), (width, height)).convert("RGBA")
+    bg = Image.alpha_composite(bg, vertical_gradient_overlay(width, height, color=(8, 16, 30), alpha_top=10, alpha_bottom=190))
+    draw = ImageDraw.Draw(bg)
+
+    badge_font = get_font(22, bold=False)
+    headline_font = get_font(84, bold=True)
+    hook_font = get_font(30, bold=False)
+    cta_font = get_font(24, bold=False)
+
+    center_x = width // 2
+    y = 120
+
+    badge = "MEDICAL TRAVEL"
+    bw = draw.textbbox((0, 0), badge, font=badge_font)[2] + 40
+    draw.rounded_rectangle((center_x - bw // 2, y, center_x + bw // 2, y + 48), radius=20, fill=(255, 255, 255, 220))
+    draw.text((center_x - bw // 2 + 20, y + 12), badge, fill=(16, 35, 74), font=badge_font)
+    y += 84
+
+    headline = safe_text(item.get("visual_headline")) or safe_text(item.get("hook"))
+    lines = wrap_text(draw, headline, headline_font, width - 180)[:3]
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=headline_font)
+        text_w = bbox[2] - bbox[0]
+        draw.text((center_x - text_w // 2, y), line, fill=(255, 255, 255), font=headline_font)
+        y += headline_font.size + 4
+
+    y += 20
+    for line in wrap_text(draw, safe_text(item.get("hook")), hook_font, width - 220)[:3]:
+        bbox = draw.textbbox((0, 0), line, font=hook_font)
+        text_w = bbox[2] - bbox[0]
+        draw.text((center_x - text_w // 2, y), line, fill=(232, 238, 247), font=hook_font)
+        y += hook_font.size + 8
+
+    cta = safe_text(item.get("cta"))
+    cta_lines = wrap_text(draw, cta, cta_font, width - 220)[:2]
+    y = height - 130
+    for line in cta_lines:
+        bbox = draw.textbbox((0, 0), line, font=cta_font)
+        text_w = bbox[2] - bbox[0]
+        draw.text((center_x - text_w // 2, y), line, fill=(218, 228, 244), font=cta_font)
+        y += cta_font.size + 6
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    bg.convert("RGB").save(out_path)
+
+def compose_facebook_creative(item: Dict, raw_image_path: Path, out_path: Path):
+    width, height = DEFAULT_PLATFORM_RULES["facebook"]["canvas_size"]
+    bg = fit_image_cover(Image.open(raw_image_path).convert("RGB"), (width, height)).convert("RGBA")
+    draw = ImageDraw.Draw(bg)
+
+    card_h = 420
+    card_y = height - card_h - 38
+    draw.rounded_rectangle((42, card_y, width - 42, height - 42), radius=32, fill=(255, 255, 255, 232))
+
+    badge_font = get_font(22, bold=False)
+    headline_font = get_font(60, bold=True)
+    body_font = get_font(28, bold=False)
+    cta_font = get_font(24, bold=False)
+
+    x = 82
+    y = card_y + 34
+    draw.rounded_rectangle((x, y, x + 218, y + 44), radius=18, fill=(230, 238, 252))
+    draw.text((x + 16, y + 10), "PREMIUM HEALTH", fill=(16, 35, 74), font=badge_font)
+    y += 72
+
+    headline = safe_text(item.get("visual_headline")) or safe_text(item.get("hook"))
+    for line in wrap_text(draw, headline, headline_font, width - 164)[:3]:
+        draw.text((x, y), line, fill=(26, 35, 52), font=headline_font)
+        y += headline_font.size + 2
+
+    y += 12
+    body_text = safe_text(item.get("hook"))
+    for line in wrap_text(draw, body_text, body_font, width - 164)[:3]:
+        draw.text((x, y), line, fill=(72, 80, 96), font=body_font)
+        y += body_font.size + 8
+
+    y += 18
+    cta = safe_text(item.get("cta"))
+    for line in wrap_text(draw, cta, cta_font, width - 164)[:2]:
+        draw.text((x, y), line, fill=(34, 64, 120), font=cta_font)
+        y += cta_font.size + 6
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    bg.convert("RGB").save(out_path)
+
+def compose_platform_creative(item: Dict, raw_image_path: Path, out_path: Path):
+    if item["platform"] == "x":
+        compose_x_creative(item, raw_image_path, out_path)
+    elif item["platform"] == "instagram":
+        compose_instagram_creative(item, raw_image_path, out_path)
+    else:
+        compose_facebook_creative(item, raw_image_path, out_path)
+
+def generate_one_valid_item(llm: DeepSeekClient, row_dict: Dict, max_regen_attempts: int) -> Dict:
+    last_item = None
+    history = []
+    for i in range(1, max_regen_attempts + 1):
+        item = normalize_output(llm.chat_json(system_prompt(), make_user_prompt(row_dict)), row_dict)
+        errs = validate_item(item)
+        if not errs:
+            item["regen_attempts"] = i
+            item["validation_errors"] = ""
+            return item
+        history.append(f"attempt_{i}=" + "|".join(errs))
+        last_item = item
+        logger.warning("Validation failed on attempt %s: %s", i, errs)
+    assert last_item is not None
+    last_item["regen_attempts"] = max_regen_attempts
+    last_item["validation_errors"] = " ; ".join(history)
+    last_item["is_compliance_pass"] = 0
+    last_item["risk_flags"] = (last_item.get("risk_flags", "") + "; validation_failed").strip("; ")
+    return last_item
+
+def generate_assets(config: Config, prompt_df: pd.DataFrame) -> pd.DataFrame:
+    out_csv = config.content_dir / "deepseek_generated_posts.csv"
+    out_jsonl = config.content_dir / "deepseek_generated_posts.jsonl"
+    raw_root = config.content_dir / "generated_images"
+    final_root = config.content_dir / "final_creatives"
+    for p in config.platforms:
+        (raw_root / p).mkdir(parents=True, exist_ok=True)
+        (final_root / p).mkdir(parents=True, exist_ok=True)
+
+    llm = DeepSeekClient(config.text_api_key, config.text_base_url, config.text_model, config.temperature)
+    hf = HuggingFaceFreeImageClient(config.hf_token, config.hf_image_model, config.hf_timeout)
+    rows = []
+
+    with out_jsonl.open("w", encoding="utf-8") as jf:
+        for idx, (_, row) in enumerate(prompt_df.iterrows(), start=1):
+            row_dict = row.to_dict()
+            logger.info("Generating %s/%s | %s | %s | %s", idx, len(prompt_df), row_dict["platform"], row_dict["category"], row_dict["language"])
+            item = generate_one_valid_item(llm, row_dict, config.max_regen_attempts)
+            final_prompt = build_final_image_prompt(item)
+            item["final_image_prompt"] = final_prompt
+
+            stem = f"{idx:03d}_{item['platform']}_{item['category']}_{item['language']}"
+            raw_path = raw_root / item["platform"] / f"{stem}.png"
+            layout_path = final_root / item["platform"] / f"{stem}_layout.png"
+
+            if config.generate_raw_image:
+                logger.info("Generating free image via Hugging Face: %s", raw_path.name)
+                hf.generate(final_prompt, raw_path)
+                item["image_path"] = str(raw_path.relative_to(config.project_root))
+
+            if config.generate_layout and raw_path.exists():
+                compose_platform_creative(item, raw_path, layout_path)
+                item["layout_path"] = str(layout_path.relative_to(config.project_root))
+
+            rows.append(item)
+            jf.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+    df = pd.DataFrame(rows)
+    df.to_csv(out_csv, index=False, encoding="utf-8-sig")
+    logger.info("Saved CSV: %s", out_csv)
+    logger.info("Saved JSONL: %s", out_jsonl)
+    return df
+
+def parse_args():
+    p = argparse.ArgumentParser(description="DeepSeek + free image + platform-split ad creative generator")
+    p.add_argument("--project-root", type=str, default=".")
+    p.add_argument("--temperature", type=float, default=0.9)
+    p.add_argument("--hf-timeout", type=int, default=180)
+    p.add_argument("--max-regen-attempts", type=int, default=3)
+    p.add_argument("--languages", nargs="+", default=["en"])
+    p.add_argument("--platforms", nargs="+", default=["x", "instagram", "facebook"])
+    p.add_argument("--skip-raw-image", action="store_true")
+    p.add_argument("--skip-layout", action="store_true")
+    return p.parse_args()
+
+def main():
+    load_dotenv()
+    args = parse_args()
+    random.seed(42)
+
+    project_root = Path(args.project_root).resolve()
+    content_dir = project_root / "content"
+    content_dir.mkdir(parents=True, exist_ok=True)
+
+    config = Config(
+        project_root=project_root,
+        content_dir=content_dir,
+        max_regen_attempts=args.max_regen_attempts,
+        temperature=args.temperature,
+        text_model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat").strip(),
+        text_base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip(),
+        text_api_key=os.getenv("DEEPSEEK_API_KEY", "").strip(),
+        hf_token=os.getenv("HF_TOKEN", "").strip(),
+        hf_image_model=os.getenv("HF_IMAGE_MODEL", "stabilityai/stable-diffusion-xl-base-1.0").strip(),
+        hf_timeout=args.hf_timeout,
+        languages=args.languages,
+        platforms=args.platforms,
+        generate_raw_image=not args.skip_raw_image,
+        generate_layout=not args.skip_layout,
+    )
+
+    if not config.text_api_key:
+        raise ValueError("Missing DEEPSEEK_API_KEY in .env")
+    if config.generate_raw_image and not config.hf_token:
+        raise ValueError("Missing HF_TOKEN in .env")
+
+    promo_user, promo_soft, keywords_df, categories_df = load_inputs(project_root)
+    if promo_user.empty and promo_soft.empty:
+        raise FileNotFoundError(f"promo_user.csv and promo_soft.csv are both missing under {project_root / 'analyze' / 'promo_outputs'}")
+
+    prompt_df = build_prompt_bank(promo_user, promo_soft, keywords_df, categories_df, config.platforms, config.languages)
+    logger.info("Prompt bank created: %s rows", len(prompt_df))
+    generate_assets(config, prompt_df)
+
+if __name__ == "__main__":
+    main()
